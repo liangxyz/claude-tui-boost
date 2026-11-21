@@ -9,9 +9,15 @@ on:
         description: 'Exact published package version (example: v0.2.7-rc.1)'
         required: true
         type: string
+      candidate_run_id:
+        description: 'Successful Plugin source and distributable package run on the release branch'
+        required: true
+        type: string
 
 permissions:
   contents: write
+  actions: read
+  checks: read
 
 concurrency:
   group: standalone-plugin-release
@@ -20,27 +26,23 @@ concurrency:
 jobs:
   publish:
     name: Verify tagged source and publish complete installable archive
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
       CGO_ENABLED: '0'
-      ANTHROPIC_API_KEY: ''
-      ANTHROPIC_AUTH_TOKEN: ''
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: '1.4.2'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - uses: actions/setup-go@v6
         with:
           go-version: '1.27.2'
-          cache-dependency-path: runtime/go.mod
+          cache: false
       - name: Fail closed on wrong ref, release tag, or existing release
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -64,42 +66,39 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo 'Release already exists; refusing mutation.' >&2; exit 2;
           fi
-      - name: Install offline synthetic CLI and PTY tools
+      - name: Verify successful candidate checks for the source being released
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y tmux
-          mkdir -p "$RUNNER_TEMP/offline-claude"
-          cat > "$RUNNER_TEMP/offline-claude/claude" <<'STUB'
-          #!/usr/bin/env sh
-          if [ "${1:-}" = '--version' ]; then echo '2.1.300 (isolated CLI probe)'; exit 0; fi
-          echo 'Real Claude model requests are forbidden in release CI' >&2
-          exit 93
-          STUB
-          chmod 700 "$RUNNER_TEMP/offline-claude/claude"
-          echo "$RUNNER_TEMP/offline-claude" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v4
-        with:
-          repository: yetone/magpie
-          ref: v0.1.1268
-          path: .compat-host
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /internal/plugin/host.js
-            /LICENSE
-      - name: Verify unmodified host integration and real package tests
-        env:
-          MAGPIE_TUI_TEST_HOST: ${{ github.workspace }}/.compat-host/internal/plugin/host.js
-        run: bun test
-      - name: Race test and vet included Go Runtime
-        working-directory: runtime
-        env:
-          CGO_ENABLED: '1'
-        run: |
-          go test -race -p 2 ./... -count=1 -timeout=240s
-          go vet -p 2 ./...
+          candidate="release/$RELEASE_TAG"
+          api="repos/$GITHUB_REPOSITORY"
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          git fetch --no-tags --depth=1 origin "refs/heads/$candidate"
+          candidate_tree=refs/remotes/origin/verified-release-candidate
+          git update-ref "$candidate_tree" FETCH_HEAD
+          gh api "$api/actions/runs/$CANDIDATE_RUN_ID" | jq -e --arg repo "$GITHUB_REPOSITORY" --arg branch "$candidate" '
+            .head_repository.full_name == $repo and .head_branch == $branch and .event == "workflow_dispatch" and
+            .path == ".github/workflows/plugin-pr-ci.yml" and .status == "completed" and .conclusion == "success"' >/dev/null
+          check_url=$(gh api "$api/actions/runs/$CANDIDATE_RUN_ID/jobs?filter=latest" | jq -er '
+            [.jobs[] | select(.name == "test-and-pack" and .conclusion == "success")] |
+            select(length == 1) | .[0].check_run_url | select(type == "string" and length > 0)')
+          ref=$(jq -nr --arg ref "heads/$candidate" '$ref | @uri')
+          gh api --paginate "$api/commits/$ref/check-runs?check_name=test-and-pack&filter=all&per_page=100" |
+            jq -se --arg check "$check_url" '
+              any(.[].check_runs[]; .url == $check and .app.slug == "github-actions" and .conclusion == "success")' >/dev/null
+          # Release branches are maintained by repository writers and promoted by fast-forward.
+          git fetch --no-tags --depth=1 origin "refs/heads/$candidate"
+          if ! git merge-base --is-ancestor "$candidate_tree" FETCH_HEAD || ! git merge-base --is-ancestor FETCH_HEAD "$candidate_tree"; then
+            echo 'Candidate moved during verification.' >&2; exit 2
+          fi
+          if ! git diff --quiet --no-renames "$candidate_tree" HEAD -- . ':(top,exclude).github/workflows/publish-v0.1.0.yml'; then
+            echo 'Main and the tested candidate differ outside the publish workflow.' >&2; exit 2
+          fi
+          printf 'Candidate CI: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CANDIDATE_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
       - name: Verify all eight binaries reproduce byte for byte
         shell: bash
         run: |
@@ -131,8 +130,6 @@ jobs:
           test -s "$RUNNER_TEMP/plugin-release/package/package-assets.json"
           test -s "$RUNNER_TEMP/plugin-release/package/scripts/magpie-tui-doctor.mjs"
           test -s "$RUNNER_TEMP/plugin-release/package/RELEASE_NOTES.md"
-          # .compat-host is an intentionally untracked, isolated upstream
-          # fixture. Only tracked source modifications are forbidden here.
           git diff --quiet && git diff --cached --quiet || {
             echo 'Release verification unexpectedly modified tracked source.' >&2; exit 2;
           }
